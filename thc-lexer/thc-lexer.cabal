@@ -1,0 +1,12 @@
+name: thc-core
+version: 0.1.0.0
+author: Travis Athougies<travis@athougies.net>
+cabal-version: 2.0
+category: Language
+description: Lexer for THC haskell compiler
+license: mit
+
+library
+        default-language: Haskell2010
+        default-extensions: MultiParamTypeClasses
+        exposed-modules: Language.Haskell.THC.Syntax.Lexer
