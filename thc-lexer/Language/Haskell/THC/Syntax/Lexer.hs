@@ -10,6 +10,7 @@ module Language.Haskell.THC.Syntax.Lexer where
 
 import           Control.Monad.Trans
 
+import           Data.Char (isSpace )
 import           Data.FingerTree (FingerTree)
 import qualified Data.FingerTree as FingerTree
 import           Data.Maybe (maybe)
@@ -331,4 +332,5 @@ lexHaskell (ThcLexStateLexing r (Lexer fn br)) c =
       Just l' -> ( Nothing, ThcLexStateLexing (T.snoc r c) l' )
 lexHaskell ThcLexStateWhitespace c
     | isSpace c = (Nothing, ThcLexStateWhitespace)
-    | otherwise = (Nothing, ThcLexStateLexing
+    | otherwise = (Nothing, ThcLexStateLexing (T.singleton c) (advanceLexer lexer c))
+
