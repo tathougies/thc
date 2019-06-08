@@ -1,12 +1,21 @@
-name: thc-core
+name: thc-lexer
 version: 0.1.0.0
 author: Travis Athougies<travis@athougies.net>
 cabal-version: 2.0
 category: Language
 description: Lexer for THC haskell compiler
-license: mit
+license: MIT
+build-type: Simple
 
 library
         default-language: Haskell2010
         default-extensions: MultiParamTypeClasses
         exposed-modules: Language.Haskell.THC.Syntax.Lexer
+                         Language.Haskell.THC.Syntax.SourceFile
+        build-depends: base, fingertree, text, mtl, ansi-terminal
+
+executable thc-lex-highlight
+        hs-source-dir: apps
+        main-is: LexHighlight.hs
+        build-depends: base, thc-lexer
+        extra-libraries: iconv
