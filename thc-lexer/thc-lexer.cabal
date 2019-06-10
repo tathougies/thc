@@ -18,4 +18,4 @@ executable thc-lex-highlight
         hs-source-dir: apps
         main-is: LexHighlight.hs
         build-depends: base, thc-lexer
-        extra-libraries: iconv
+--        extra-libraries: iconv
