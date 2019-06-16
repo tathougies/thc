@@ -1,0 +1,31 @@
+name: pinky
+version: 1.0.0.0
+author: Travis Athougies<travis@athougies.net>
+cabal-version: 2.0
+category: Language
+description: A faster finger-tree that substitutes indexed type families for polymorphic recursion
+license: MIT
+build-type: Simple
+
+library
+        default-language: Haskell2010
+        default-extensions: MultiParamTypeClasses
+        exposed-modules: Data.FingerTree.Pinky
+        build-depends: base
+        ghc-options: -O3
+
+executable pinky-test
+        default-language: Haskell2010
+        default-extensions: MultiParamTypeClasses, FlexibleInstances
+        main-is: pinky.hs
+        hs-source-dirs: benchmarks
+        ghc-options: -O3
+        build-depends: base, pinky
+
+executable fingertree-test
+        default-language: Haskell2010
+        default-extensions: MultiParamTypeClasses, FlexibleInstances
+        main-is: fingertree.hs
+        hs-source-dirs: benchmarks
+        ghc-options: -O3
+        build-depends: base, fingertree

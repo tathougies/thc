@@ -1,0 +1,23 @@
+name: cyk
+version: 0.1.0.0
+author: Travis Athougies<travis@athougies.net>
+cabal-version: 2.0
+category: Language
+description: Parallel and incremental CYK parser for Haskell
+license: MIT
+build-type: Simple
+
+library
+        default-language: Haskell2010
+        default-extensions: MultiParamTypeClasses
+        exposed-modules: Text.CYK.Parser
+        other-modules: Text.CYK.FingerTree
+        ghc-options: -O2 -threaded
+        build-depends: base, pinky, text, mtl, ghc-prim, vector, containers, parallel, dump-core, transformers
+
+executable test-cyk-expr
+        hs-source-dir: tests
+        main-is: CykExpr.hs
+        build-depends: base, cyk, text, parallel
+        extra-libraries: iconv
+        ghc-options: -O2 -threaded -rtsopts

@@ -12,7 +12,7 @@ library
         default-extensions: MultiParamTypeClasses
         exposed-modules: Language.Haskell.THC.Syntax.Lexer
                          Language.Haskell.THC.Syntax.SourceFile
-        build-depends: base, fingertree, text, mtl, ansi-terminal
+        build-depends: base, pinky, text, mtl, ansi-terminal
 
 executable thc-lex-highlight
         hs-source-dir: apps

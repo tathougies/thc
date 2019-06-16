@@ -13,8 +13,8 @@ import           Control.Arrow ( (&&&) )
 import           Control.Monad.Trans
 
 import           Data.Char (isSpace, isUpper, chr )
-import           Data.FingerTree (FingerTree)
-import qualified Data.FingerTree as FingerTree
+import           Data.FingerTree.Pinky (FingerTree)
+import qualified Data.FingerTree.Pinky as FingerTree
 import           Data.Maybe (maybe, catMaybes)
 import           Data.Monoid
 import           Data.String
@@ -65,6 +65,7 @@ data ThcLexeme
     | ThcLexemeOf
     | ThcLexemeDo
     | ThcLexemeForall
+    | ThcLexemeSemicolon
 
     | ThcLexemeOpenParen
     | ThcLexemeCloseParen
@@ -89,12 +90,9 @@ data ThcLexeme
     | ThcLexemeMLCommentStart
 
     | ThcLexemeWhitespace
-    | ThcLexemeIndent !Int
+    | ThcLexemeIndent !Word
 
       deriving Show
-
-newtype ThcIndentStack = ThcIndentStack [Int]
-    deriving Show
 
 data LexOneBranch a = LexOneBranch Char (Maybe (Lexer a))
 
@@ -195,6 +193,7 @@ lexer = "case"     $=> ThcLexemeCase
     ||| "=>"       $=> ThcLexemeContext
     ||| "="        $=> ThcLexemeEqual
     ||| "::"       $=> ThcLexemeHasType
+    ||| ";"        $=> ThcLexemeSemicolon
     ||| ","        $=> ThcLexemeComma
     ||| space      $=> ThcLexemeWhitespace
     ||| (nl <> space) $=\> makeIndentation
@@ -223,7 +222,8 @@ Lexer r a ||| Lexer _ b = Lexer r (combineBranch a b)
 makeIndentation :: Text -> ThcLexeme
 makeIndentation = ThcLexemeIndent . T.foldl (\i c -> if c == '\t'
                                                      then ((i + 8) `div` 8) * 8
-                                                     else i + 1) 0
+                                                     else if c `elem` ("\r\n\f" :: [Char])
+                                                          then 0 else i + 1) 0
 
 combineBranch :: LexBranch a -> LexBranch a -> LexBranch a
 combineBranch (LexBranch a') (LexBranch b') =
