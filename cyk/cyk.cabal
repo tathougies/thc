@@ -19,5 +19,5 @@ executable test-cyk-expr
         hs-source-dir: tests
         main-is: CykExpr.hs
         build-depends: base, cyk, text, parallel
-        extra-libraries: iconv
+--        extra-libraries: iconv
         ghc-options: -O2 -threaded -rtsopts

@@ -43,7 +43,7 @@ data ThcCommented a
     | ThcLineIndent !Int
       deriving Show
 
-data ThcLexeme
+data ThcLexemeC
     = ThcLexemeModule
     | ThcLexemeLet
     | ThcLexemeWhere
@@ -76,21 +76,25 @@ data ThcLexeme
     | ThcLexemeOpenIndent
     | ThcLexemeCloseIndent
 
-    | ThcLexemeIdentifier ThcIdentifier
-    | ThcLexemeOperator ThcIdentifier
-
     | ThcLexemeContext
     | ThcLexemeArrow
+      deriving (Show, Enum, Bounded)
 
-    | ThcLexemeRational Rational
-    | ThcLexemeText     Text
-    | ThcLexemeChar     Char
+data ThcLexeme
+    = ThcLexemeSimple ThcLexemeC
 
     | ThcLexemeCommentStart
     | ThcLexemeMLCommentStart
 
     | ThcLexemeWhitespace
     | ThcLexemeIndent !Word
+
+    | ThcLexemeIdentifier ThcIdentifier
+    | ThcLexemeOperator ThcIdentifier
+
+    | ThcLexemeRational Rational
+    | ThcLexemeText     Text
+    | ThcLexemeChar     Char
 
       deriving Show
 
@@ -105,23 +109,29 @@ newtype LexBranch a
 data Lexer a
     = Lexer (Maybe (Text -> a)) (LexBranch a)
 
-isKeywordToken, isConstructor, isLiteral :: ThcLexeme -> Bool
-isKeywordToken ThcLexemeModule = True
-isKeywordToken ThcLexemeLet = True
-isKeywordToken ThcLexemeWhere = True
-isKeywordToken ThcLexemeIf = True
-isKeywordToken ThcLexemeIn = True
-isKeywordToken ThcLexemeThen = True
-isKeywordToken ThcLexemeElse = True
-isKeywordToken ThcLexemeData = True
-isKeywordToken ThcLexemeType = True
-isKeywordToken ThcLexemeNewtype = True
-isKeywordToken ThcLexemeDeriving = True
-isKeywordToken ThcLexemeCase = True
-isKeywordToken ThcLexemeImport = True
-isKeywordToken ThcLexemeDo = True
-isKeywordToken ThcLexemeForall = True
-isKeywordToken ThcLexemeOf = True
+isKeywordToken, isConstructor, isLiteral, isWhitespace :: ThcLexeme -> Bool
+isWhitespace (ThcLexemeIndent {}) = True
+isWhitespace ThcLexemeWhitespace = True
+isWhitespace ThcLexemeCommentStart = True
+isWhitespace ThcLexemeMLCommentStart = True
+isWhitespace _ = False
+
+isKeywordToken (ThcLexemeSimple ThcLexemeModule) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeLet) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeWhere) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeIf) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeIn) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeThen) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeElse) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeData) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeType) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeNewtype) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeDeriving) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeCase) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeImport) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeDo) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeForall) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeOf) = True
 isKeywordToken _ = False
 
 isConstructor (ThcLexemeOperator i) = isConstructorIdentifier i
@@ -163,38 +173,39 @@ instance Semigroup LexerBuilder where
     LexerBuilder a <> LexerBuilder b = LexerBuilder (a . b)
 
 lexer :: Lexer ThcLexeme
-lexer = "case"     $=> ThcLexemeCase
-    ||| "module"   $=> ThcLexemeModule
-    ||| "where"    $=> ThcLexemeWhere
-    ||| "let"      $=> ThcLexemeLet
-    ||| "if"       $=> ThcLexemeIf
-    ||| "then"     $=> ThcLexemeThen
-    ||| "else"     $=> ThcLexemeElse
-    ||| "data"     $=> ThcLexemeData
-    ||| "newtype"  $=> ThcLexemeNewtype
-    ||| "deriving" $=> ThcLexemeDeriving
-    ||| "\\"       $=> ThcLexemeLambda
-    ||| "import"   $=> ThcLexemeImport
-    ||| "in"       $=> ThcLexemeIn
-    ||| "of"       $=> ThcLexemeOf
-    ||| "do"       $=> ThcLexemeDo
-    ||| "forall"   $=> ThcLexemeForall
+lexer = "case"     $=> ThcLexemeSimple ThcLexemeCase
+    ||| "module"   $=> ThcLexemeSimple ThcLexemeModule
+    ||| "where"    $=> ThcLexemeSimple ThcLexemeWhere
+    ||| "let"      $=> ThcLexemeSimple ThcLexemeLet
+    ||| "if"       $=> ThcLexemeSimple ThcLexemeIf
+    ||| "then"     $=> ThcLexemeSimple ThcLexemeThen
+    ||| "else"     $=> ThcLexemeSimple ThcLexemeElse
+    ||| "data"     $=> ThcLexemeSimple ThcLexemeData
+    ||| "newtype"  $=> ThcLexemeSimple ThcLexemeNewtype
+    ||| "type"     $=> ThcLexemeSimple ThcLexemeType
+    ||| "deriving" $=> ThcLexemeSimple ThcLexemeDeriving
+    ||| "\\"       $=> ThcLexemeSimple ThcLexemeLambda
+    ||| "import"   $=> ThcLexemeSimple ThcLexemeImport
+    ||| "in"       $=> ThcLexemeSimple ThcLexemeIn
+    ||| "of"       $=> ThcLexemeSimple ThcLexemeOf
+    ||| "do"       $=> ThcLexemeSimple ThcLexemeDo
+    ||| "forall"   $=> ThcLexemeSimple ThcLexemeForall
     ||| "--"       $=> ThcLexemeCommentStart
     ||| "{-"       $=> ThcLexemeMLCommentStart
-    ||| "("        $=> ThcLexemeOpenParen
-    ||| ")"        $=> ThcLexemeCloseParen
-    ||| "|"        $=> ThcLexemeBar
-    ||| "{"        $=> ThcLexemeOpenIndent
-    ||| "}"        $=> ThcLexemeCloseIndent
-    ||| "["        $=> ThcLexemeOpenBracket
-    ||| "]"        $=> ThcLexemeCloseBracket
-    ||| "-"        $=> ThcLexemeMinus
-    ||| "->"       $=> ThcLexemeArrow
-    ||| "=>"       $=> ThcLexemeContext
-    ||| "="        $=> ThcLexemeEqual
-    ||| "::"       $=> ThcLexemeHasType
-    ||| ";"        $=> ThcLexemeSemicolon
-    ||| ","        $=> ThcLexemeComma
+    ||| "("        $=> ThcLexemeSimple ThcLexemeOpenParen
+    ||| ")"        $=> ThcLexemeSimple ThcLexemeCloseParen
+    ||| "|"        $=> ThcLexemeSimple ThcLexemeBar
+    ||| "{"        $=> ThcLexemeSimple ThcLexemeOpenIndent
+    ||| "}"        $=> ThcLexemeSimple ThcLexemeCloseIndent
+    ||| "["        $=> ThcLexemeSimple ThcLexemeOpenBracket
+    ||| "]"        $=> ThcLexemeSimple ThcLexemeCloseBracket
+    ||| "-"        $=> ThcLexemeSimple ThcLexemeMinus
+    ||| "->"       $=> ThcLexemeSimple ThcLexemeArrow
+    ||| "=>"       $=> ThcLexemeSimple ThcLexemeContext
+    ||| "="        $=> ThcLexemeSimple ThcLexemeEqual
+    ||| "::"       $=> ThcLexemeSimple ThcLexemeHasType
+    ||| ";"        $=> ThcLexemeSimple ThcLexemeSemicolon
+    ||| ","        $=> ThcLexemeSimple ThcLexemeComma
     ||| space      $=> ThcLexemeWhitespace
     ||| (nl <> space) $=\> makeIndentation
 

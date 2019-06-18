@@ -1,3 +1,4 @@
 packages: thc-lexer
           cyk
           pinky
+          thc-parser

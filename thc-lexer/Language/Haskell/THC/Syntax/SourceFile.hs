@@ -1,3 +1,4 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE FlexibleInstances #-}
@@ -12,6 +13,7 @@ import           Control.Monad.State
 
 import           Data.FingerTree.Pinky (FingerTree, Measured)
 import qualified Data.FingerTree.Pinky as FingerTree
+import           Data.Maybe (fromMaybe)
 import           Data.Monoid (Last(..), Sum(..))
 import           Data.Text (Text)
 import qualified Data.Text as T
@@ -96,11 +98,11 @@ readSourceText src = do
       isComment (ThcCode ThcLexemeIndent {}) = True
       isComment _ = False
 
-      beginsBlock (ThcCode ThcLexemeWhere) = True
-      beginsBlock (ThcCode ThcLexemeOf) = True
-      beginsBlock (ThcCode ThcLexemeLet) = True
-      beginsBlock (ThcCode ThcLexemeIf) = True
-      beginsBlock (ThcCode ThcLexemeDo) = True
+      beginsBlock (ThcCode (ThcLexemeSimple ThcLexemeWhere)) = True
+      beginsBlock (ThcCode (ThcLexemeSimple ThcLexemeOf)) = True
+      beginsBlock (ThcCode (ThcLexemeSimple ThcLexemeLet)) = True
+      beginsBlock (ThcCode (ThcLexemeSimple ThcLexemeIf)) = True
+      beginsBlock (ThcCode (ThcLexemeSimple ThcLexemeDo)) = True
       beginsBlock _ = False
 
       source = FingerTree.fromList [ PlacedText src src (countNewlines src) ]
@@ -121,46 +123,36 @@ readSourceText src = do
     in SourceFile isComment beginsBlock source (doIndent source tokenTree)
 
 doIndent source toks =
-  case runState (FingerTree.traverseWithPos calcIndent toks) [] of
-    (toks', []) -> toks'
-    (toks', [0]) -> toks'
-    (toks', stk) -> case FingerTree.viewr toks' of
-                      FingerTree.EmptyR -> error "doIndent: no tokens"
-                      toks'' FingerTree.:> lastTok
-                        | all (/= 0) stk ->
-                            toks'' FingerTree.|> lastTok { ptTokenPhantomAfter = (ThcCode ThcLexemeCloseIndent <$ stk) }
-                        | otherwise -> error ("no closing indent: " ++ show stk)
+  let (toks', (stk, _)) = runState (FingerTree.traverseWithPos calcIndent toks) ([], Nothing)
+  in case FingerTree.viewr toks' of
+       FingerTree.EmptyR -> error "doIndent: no tokens"
+       toks'' FingerTree.:> lastTok
+           | null stk || stk == [0] || all (/= 0) stk ->
+               let lastBlock = if fromMaybe False (ptpLastIsBlock (FingerTree.measure toks'))
+                               then [ ThcCode (ThcLexemeSimple ThcLexemeOpenIndent)
+                                    , ThcCode (ThcLexemeSimple ThcLexemeCloseIndent) ]
+                               else []
+               in trace ("Got stack " ++ show stk) $
+                  toks'' FingerTree.|> lastTok { ptTokenPhantomAfter = lastBlock ++ (ThcCode (ThcLexemeSimple ThcLexemeCloseIndent) <$ stk) }
+           | otherwise -> error ("no closing indent: " ++ show stk)
   where
-    getIndentStack = get
-    putIndentStack = put
+    getIndentStack = fmap fst get
+    putIndentStack s = do
+      (_, n) <- get
+      put (s, n)
+
+    setIndent n = do
+      (s, _) <- get
+      put (s, n)
+    getIndent = fmap snd get
 
     calcIndent PlacedTokenPos { ptpLastIsBlock = Just True } tok@(PlacedToken { ptIsComment = True }) = pure tok
-    calcIndent PlacedTokenPos { ptpLastIsBlock = Just True, ptpPosition = p } tok = do
-      let (line, column) = resolveLineCol source p
-      stk <- trace ("Resolved " ++ show (p, tok) ++ "; " ++ show (line, column)) getIndentStack
-      case stk of
-        m:ms | column > m -> do
-                 putIndentStack (column:stk)
-                 pure tok { ptTokenPhantomBefore = [ ThcCode ThcLexemeOpenIndent ] }
-        [] -> do
-          putIndentStack (column:stk)
-          pure tok { ptTokenPhantomBefore = [ ThcCode ThcLexemeOpenIndent ] }
-        _ -> pure tok { ptTokenPhantomBefore = [ ThcCode ThcLexemeOpenIndent, ThcCode ThcLexemeCloseIndent ] }
 
     calcIndent ptp tok@(PlacedToken { ptToken = ThcCode (ThcLexemeIndent n) }) = do
-      stk <- getIndentStack
-      case stk of
-        m:ms -> do let (closes, rest) = span (>n) stk
-                       last = case rest of
-                                m':_ | m' == n -> [ ThcCode ThcLexemeSemicolon ]
-                                _ -> []
-                       tok' = tok { ptTokenPhantomBefore = (ThcCode ThcLexemeCloseIndent <$ closes) ++ last }
+      setIndent (Just n)
+      pure tok
 
-                   putIndentStack rest
-                   trace ("Closing at " ++ show tok' ++ " " ++ show (stk, n, last)) (pure tok')
-        _ -> pure tok
-
-    calcIndent _ tok@(PlacedToken { ptToken = ThcCode ThcLexemeCloseIndent }) = do
+    calcIndent _ tok@(PlacedToken { ptToken = ThcCode (ThcLexemeSimple ThcLexemeCloseIndent) }) = do
       stk <- getIndentStack
       case stk of
         0:ms -> do
@@ -168,12 +160,43 @@ doIndent source toks =
           pure tok
         _ -> pure tok -- Error
 
-    calcIndent _ tok@(PlacedToken { ptToken = ThcCode ThcLexemeOpenIndent }) = do
+    calcIndent _ tok@(PlacedToken { ptToken = ThcCode (ThcLexemeSimple ThcLexemeOpenIndent) }) = do
       stk <- getIndentStack
       putIndentStack (0:stk)
       pure tok
 
-    calcIndent _ tok = pure tok
+    calcIndent PlacedTokenPos { ptpLastIsBlock = Just True, ptpPosition = p } tok = do
+      let (line, column) = resolveLineCol source p
+      stk <- trace ("Resolved " ++ show (p, tok) ++ "; " ++ show (line, column)) getIndentStack
+      case stk of
+        m:ms | column > m -> do
+                 putIndentStack (column:stk)
+                 pure tok { ptTokenPhantomBefore = [ ThcCode (ThcLexemeSimple ThcLexemeOpenIndent) ] }
+        [] -> do
+          putIndentStack (column:stk)
+          pure tok { ptTokenPhantomBefore = [ ThcCode (ThcLexemeSimple ThcLexemeOpenIndent) ] }
+        _ -> pure tok { ptTokenPhantomBefore = [ ThcCode (ThcLexemeSimple ThcLexemeOpenIndent)
+                                               , ThcCode (ThcLexemeSimple ThcLexemeCloseIndent) ] }
+
+    calcIndent _ tok = checkIndent tok
+
+    checkIndent tok = do
+      n <- getIndent
+      case n of
+        Nothing -> pure tok
+        Just n -> do
+             setIndent Nothing
+             stk <- getIndentStack
+             case stk of
+               m:ms -> do let (closes, rest) = span (>n) stk
+                              last = case rest of
+                                       m':_ | m' == n -> [ ThcCode (ThcLexemeSimple ThcLexemeSemicolon) ]
+                                       _ -> []
+                              tok' = tok { ptTokenPhantomBefore = (ThcCode (ThcLexemeSimple ThcLexemeCloseIndent) <$ closes) ++ last }
+
+                          putIndentStack rest
+                          trace ("Closing at " ++ show tok' ++ " " ++ show (stk, n, last)) (pure tok')
+               _ -> pure tok
 
 readSourceFile :: FilePath -> IO (SourceFile (ThcCommented ThcLexeme))
 readSourceFile fp =
@@ -220,9 +243,9 @@ highlight mkPhantom hiliter = go <$> sourceFileSrc <*> sourceFileTokens
 showHighlighted :: SourceFile (ThcCommented ThcLexeme) -> IO ()
 showHighlighted src = do
   let highlighted = highlight mkPhantom tokenHighlighter src
-      mkPhantom (ThcCode ThcLexemeOpenIndent) = ((ANSI.Dull, ANSI.Magenta), T.singleton '{')
-      mkPhantom (ThcCode ThcLexemeCloseIndent) = ((ANSI.Dull, ANSI.Magenta), T.singleton '}')
-      mkPhantom (ThcCode ThcLexemeSemicolon) = ((ANSI.Dull, ANSI.Magenta), T.singleton ';')
+      mkPhantom (ThcCode (ThcLexemeSimple ThcLexemeOpenIndent)) = ((ANSI.Dull, ANSI.Magenta), T.singleton '{')
+      mkPhantom (ThcCode (ThcLexemeSimple ThcLexemeCloseIndent)) = ((ANSI.Dull, ANSI.Magenta), T.singleton '}')
+      mkPhantom (ThcCode (ThcLexemeSimple ThcLexemeSemicolon)) = ((ANSI.Dull, ANSI.Magenta), T.singleton ';')
       mkPhantom _ = ((ANSI.Dull, ANSI.Magenta), T.singleton '?')
   forM_ highlighted $ \(HighlightedText (i, c) t) -> do
     ANSI.setSGR [ ANSI.SetColor ANSI.Foreground i c ]

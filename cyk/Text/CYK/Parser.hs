@@ -11,15 +11,18 @@
 {-# LANGUAGE FlexibleInstances #-}
 
 module Text.CYK.Parser
-  ( Parsed, Parser, getParseResult
+  ( Splittable(..), SplitResult(..)
+
+  , Parsed, Parser, getParseResult
   , parse, testParse, combineParses
   , ParserBuilder, RuleB, buildRule
-  , terminal, rule
+  , compile, terminal, rule
 
   , Sym, AST(..)
   , simpleParser
   , simpleRuleParser
-  , simpleRuleParserLR ) where
+  , simpleRuleParserLR
+  ) where
 
 import           Control.Applicative
 import           Control.Monad.State
@@ -66,6 +69,7 @@ data SplitResult f a
   = SplitResultNull
   | SplitResultOne !a
   | SplitResultSplit {-# UNPACK #-} !Word !f {-# UNPACK #-} !Word !f
+    deriving Show
 
 data Parser tok a where
   Parser :: Enum classification

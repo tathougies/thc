@@ -1,0 +1,20 @@
+name: thc-parser
+version: 0.1.0.0
+author: Travis Athougies<travis@athougies.net>
+cabal-version: 2.0
+category: Language
+description: Parser for THC haskell compiler
+license: MIT
+build-type: Simple
+
+library
+        default-language: Haskell2010
+        default-extensions: MultiParamTypeClasses
+        exposed-modules: Language.Haskell.THC.Syntax.Parser
+                         Language.Haskell.THC.Syntax.AST
+        build-depends: base, thc-lexer, cyk, text, pinky
+
+executable thc-test-parse
+        hs-source-dir: apps
+        main-is: TestHsParse.hs
+        build-depends: base, thc-parser, thc-lexer, cyk
