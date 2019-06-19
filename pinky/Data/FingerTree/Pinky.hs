@@ -318,9 +318,9 @@ rheadDigit (Four _ _ _ d) = d
 
 rtailDigit :: Digit l v a -> Digit l v a
 rtailDigit (One _) = error "rtailDigit: illegal argument"
-rtailDigit (Two _ b) = One b
-rtailDigit (Three _ b c) = Two b c
-rtailDigit (Four _ b c d) = Three b c d
+rtailDigit (Two a _) = One a
+rtailDigit (Three b c _) = Two b c
+rtailDigit (Four b c d _) = Three b c d
 
 digitToTree :: Measured v a => RuntimeDepth l -> Digit l v a -> FingerTreeN l v a
 digitToTree !l (One a) = Single a

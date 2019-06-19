@@ -6,11 +6,13 @@ import           Language.Haskell.THC.Syntax.Lexer
 import           Language.Haskell.THC.Syntax.SourceFile
 import           Language.Haskell.THC.Syntax.AST
 
-import           Control.Applicative ((<|>))
+import           Control.Applicative ((<|>), optional)
 import           Control.Monad
 
 import qualified Data.FingerTree.Pinky as FingerTree
 import           Data.Foldable (toList)
+
+import           Debug.Trace
 
 import           Text.CYK.Parser
 
@@ -69,6 +71,7 @@ instance Splittable ParsingSourceFile where
     getAll (ParsingSourceFile sf) =
         do pt <- toList sf
            getAllFromToken pt
+    getAll (BisectingToken ts) = ts
 
 data ThcLexemeCategory
     = ThcLexemeCategorySimple ThcLexemeC
@@ -109,6 +112,7 @@ instance Enum ThcLexemeCategory where
               _ -> error "toEnum{ThcLexemeCategory}: invalid value"
 
 match x = terminal x (\_ -> ())
+simple = match . ThcLexemeCategorySimple
 
 mkModuleName :: ThcIdentifier -> [ ThcModuleName ]
 mkModuleName (ThcIdentifier mods (ThcName t)) = mods ++ [ ThcModuleName t ]
@@ -123,6 +127,7 @@ hsLexemeCategory (ThcLexemeIndent _) = ThcLexemeCategorySpace
 hsLexemeCategory (ThcLexemeIdentifier i)
     | isConstructorIdentifier i = ThcLexemeCategoryConstructor
     | otherwise = ThcLexemeCategoryIdentifier
+hsLexemeCategory (ThcLexemeOperator _) = ThcLexemeCategoryOperator
 hsLexemeCategory (ThcLexemeRational _) = ThcLexemeCategoryRational
 hsLexemeCategory (ThcLexemeText _) = ThcLexemeCategoryText
 hsLexemeCategory (ThcLexemeChar _) = ThcLexemeCategoryChar
@@ -135,22 +140,39 @@ hsModParser =
 
       identifierT <- buildRule (rule idT <|> rule consT)
 
-      let oParen = match (ThcLexemeCategorySimple ThcLexemeOpenParen)
+      operatorT <- buildRule (terminal ThcLexemeCategoryOperator (\(ThcLexemeOperator id) -> id))
+
+      let nameT = fmap (\(ThcIdentifier _ nm) -> nm) (rule identifierT) -- TODO
+
+          oParen = match (ThcLexemeCategorySimple ThcLexemeOpenParen)
           cParen = match (ThcLexemeCategorySimple ThcLexemeCloseParen)
+          oBracket = match (ThcLexemeCategorySimple ThcLexemeOpenBracket)
+          cBracket = match (ThcLexemeCategorySimple ThcLexemeCloseBracket)
           oBrace = match (ThcLexemeCategorySimple ThcLexemeOpenIndent)
           cBrace = match (ThcLexemeCategorySimple ThcLexemeCloseIndent)
           comma = match (ThcLexemeCategorySimple ThcLexemeComma)
           semicolon = match (ThcLexemeCategorySimple ThcLexemeSemicolon)
 
+          hasTypeT = simple ThcLexemeHasType
+          contextT = simple ThcLexemeContext
+          funArrowT = simple ThcLexemeArrow
+
           moduleT = match (ThcLexemeCategorySimple ThcLexemeModule)
           whereT = match (ThcLexemeCategorySimple ThcLexemeWhere)
           importT = match (ThcLexemeCategorySimple ThcLexemeImport)
 
+          intT = terminal ThcLexemeCategoryRational (\(ThcLexemeRational r) -> round r) -- TODO only allow integers
+
           parens a = oParen *> a <* cParen
-          indented a = oBrace *> pure [] <* cBrace
+          brackets a = oBracket *> a <* cBracket
+          indented a = oBrace *> a <* cBrace
 
           sepBy what item = mdo
             list <- buildRule (pure [] <|> (:) <$> item <*> (pure [] <|> (what *> rule list)))
+            pure list
+
+          sepBy1 what item = mdo
+            list <- buildRule ((:) <$> item <*> (pure [] <|> (what *> rule list)))
             pure list
 
       namespaceP <- buildRule ((ThcModuleNamespaceModule <$ match (ThcLexemeCategorySimple ThcLexemeModule)) <|>
@@ -176,12 +198,55 @@ hsModParser =
       exportListP <- buildRule (fmap Just (parens (rule exportListInsideP)) <|> pure Nothing)
 
 
-      let mkModule modName exports imports = ThcModule modName exports imports
+      let mkModule modName exports (imports, decls) = ThcModule modName exports imports decls
+          addImport newImport (imports, decls) = (newImport:imports, decls)
+          addDecl newDecl (imports, decls) = (imports, newDecl:decls)
 
+      -- | imports
       importP <- buildRule (importT *> ((\n -> ThcImport (mkModuleName n) False Nothing ThcImportAll) <$> rule consT))
-      importsP <- sepBy semicolon (rule importP)
+      importsAndDeclsP <- buildRule (rule modDeclsP <|> addImport <$> rule importP <*> (pure ([], []) <|> semicolon *> rule importsAndDeclsP))
 
-      moduleP <- buildRule (moduleT *> (mkModule <$> (mkModuleName <$> rule consT) <*> rule exportListP <*> (whereT *> indented (rule importsP))))
+      -- | Fixities
 
-      pure moduleP
+      fixityP <- buildRule ((ThcFixityDecl ThcAssociativityLeft  <$ match (ThcLexemeCategorySimple ThcLexemeInfixl)) <|>
+                            (ThcFixityDecl ThcAssociativityRight <$ match (ThcLexemeCategorySimple ThcLexemeInfixr)) <|>
+                            (ThcFixityDecl ThcAssociativityNone  <$ match (ThcLexemeCategorySimple ThcLexemeInfix)))
+      fixitySymbolsP <- sepBy1 comma (rule operatorT)
+      fixityDeclP <- buildRule (rule fixityP <*> (pure 9 <|> intT) <*> (map (\(ThcIdentifier _ nm) -> nm) <$> rule fixitySymbolsP))
+
+      -- | Types
+      typeP <- buildRule (rule btypeP <|> ThcTypeFun <$> rule btypeP <*> (funArrowT *> rule typeP))
+      btypeP <- buildRule (rule atypeP <|> ThcTypeAp <$> rule btypeP <*> rule atypeP)
+--      atypeP <- buildRule (--ThcTypeTuple <$> parens (rule tupleInsideP) <|>
+--                           ThcTypeList <$> brackets (rule typeP) <|>
+--                           parens (rule typeP) -- <|>
+--                           ThcTypeVar <$> nameT <|>
+--                           rule qtyconP)
+      let atypeP = qtyconP
+      qtyconP <- buildRule (ThcTypeCon <$> rule consT <|>
+                            ThcTypeListCon <$ brackets (rule typeP)) -- <|>
+--                            ThcTypeFunTypeCon <$ parens funArrowT)
+--                            ThcTypeTupleCon <$> parens (rule tupleConInsideP))
+      --tupleConInsideP <- buildRule (pure (0 :: Word) <|> (+1) <$> (comma *> rule tupleConInsideP))
+--      tupleInsideP <- sepBy1 comma (rule typeP)
+
+
+      -- | Contexts
+      contextP <- buildRule (ThcContext <$> parens (rule manyClassesP) <|>
+                             ThcContext . pure <$> rule classPredP)
+      manyClassesP <- sepBy comma (rule classPredP <|> parens (rule contextP))
+      classArgsP <- buildRule (pure [] <|> (:) <$> rule typeP <*> rule classArgsP)
+      classPredP <- buildRule (ThcContextClass <$> rule consT <*> rule classArgsP)
+
+      -- | type decls
+      varsListP <- sepBy1 comma nameT
+      typeSigDeclP <- buildRule (ThcTypeSig <$> (rule varsListP <* hasTypeT) <*> optional (rule contextP) <*> rule typeP)
+
+      declP <- buildRule (ThcModDeclFixity <$> rule fixityDeclP <|>
+                          ThcModDeclTypeSig <$> rule typeSigDeclP)
+      modDeclsP <- buildRule (pure ([], []) <|> addDecl <$> rule declP <*> (pure ([], []) <|> semicolon *> rule modDeclsP))
+
+      moduleP <- buildRule (moduleT *> (mkModule <$> (mkModuleName <$> rule consT) <*> rule exportListP <*> (whereT *> indented (rule importsAndDeclsP))))
+
+      pure (trace "Building module" moduleP)
 

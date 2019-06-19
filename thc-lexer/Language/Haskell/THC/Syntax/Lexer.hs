@@ -65,6 +65,9 @@ data ThcLexemeC
     | ThcLexemeOf
     | ThcLexemeDo
     | ThcLexemeForall
+    | ThcLexemeInfixl
+    | ThcLexemeInfixr
+    | ThcLexemeInfix
     | ThcLexemeSemicolon
 
     | ThcLexemeOpenParen
@@ -132,6 +135,9 @@ isKeywordToken (ThcLexemeSimple ThcLexemeImport) = True
 isKeywordToken (ThcLexemeSimple ThcLexemeDo) = True
 isKeywordToken (ThcLexemeSimple ThcLexemeForall) = True
 isKeywordToken (ThcLexemeSimple ThcLexemeOf) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeInfixl) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeInfixr) = True
+isKeywordToken (ThcLexemeSimple ThcLexemeInfix) = True
 isKeywordToken _ = False
 
 isConstructor (ThcLexemeOperator i) = isConstructorIdentifier i
@@ -190,6 +196,9 @@ lexer = "case"     $=> ThcLexemeSimple ThcLexemeCase
     ||| "of"       $=> ThcLexemeSimple ThcLexemeOf
     ||| "do"       $=> ThcLexemeSimple ThcLexemeDo
     ||| "forall"   $=> ThcLexemeSimple ThcLexemeForall
+    ||| "infixl"   $=> ThcLexemeSimple ThcLexemeInfixl
+    ||| "infixr"   $=> ThcLexemeSimple ThcLexemeInfixr
+    ||| "infix"    $=> ThcLexemeSimple ThcLexemeInfix
     ||| "--"       $=> ThcLexemeCommentStart
     ||| "{-"       $=> ThcLexemeMLCommentStart
     ||| "("        $=> ThcLexemeSimple ThcLexemeOpenParen

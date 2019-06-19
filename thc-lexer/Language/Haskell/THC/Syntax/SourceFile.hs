@@ -132,8 +132,7 @@ doIndent source toks =
                                then [ ThcCode (ThcLexemeSimple ThcLexemeOpenIndent)
                                     , ThcCode (ThcLexemeSimple ThcLexemeCloseIndent) ]
                                else []
-               in trace ("Got stack " ++ show stk) $
-                  toks'' FingerTree.|> lastTok { ptTokenPhantomAfter = lastBlock ++ (ThcCode (ThcLexemeSimple ThcLexemeCloseIndent) <$ stk) }
+               in toks'' FingerTree.|> lastTok { ptTokenPhantomAfter = lastBlock ++ (ThcCode (ThcLexemeSimple ThcLexemeCloseIndent) <$ stk) }
            | otherwise -> error ("no closing indent: " ++ show stk)
   where
     getIndentStack = fmap fst get
@@ -167,7 +166,7 @@ doIndent source toks =
 
     calcIndent PlacedTokenPos { ptpLastIsBlock = Just True, ptpPosition = p } tok = do
       let (line, column) = resolveLineCol source p
-      stk <- trace ("Resolved " ++ show (p, tok) ++ "; " ++ show (line, column)) getIndentStack
+      stk <- getIndentStack
       case stk of
         m:ms | column > m -> do
                  putIndentStack (column:stk)
@@ -195,7 +194,7 @@ doIndent source toks =
                               tok' = tok { ptTokenPhantomBefore = (ThcCode (ThcLexemeSimple ThcLexemeCloseIndent) <$ closes) ++ last }
 
                           putIndentStack rest
-                          trace ("Closing at " ++ show tok' ++ " " ++ show (stk, n, last)) (pure tok')
+                          pure tok'
                _ -> pure tok
 
 readSourceFile :: FilePath -> IO (SourceFile (ThcCommented ThcLexeme))
@@ -215,6 +214,7 @@ tokenHighlighter (ThcCode c)
   | isLiteral c = (ANSI.Vivid, ANSI.Red)
 tokenHighlighter (ThcCode (ThcLexemeIdentifier {})) = (ANSI.Vivid, ANSI.White)
 tokenHighlighter (ThcCode (ThcLexemeOperator {})) = (ANSI.Dull, ANSI.Yellow)
+tokenHighlighter (ThcCode (ThcLexemeSimple ThcLexemeHasType)) = (ANSI.Vivid, ANSI.Green)
 tokenHighlighter _ = (ANSI.Dull, ANSI.White)
 
 highlight :: (tok -> (cls, Text)) -> (tok -> cls) -> SourceFile tok -> [ HighlightedText cls ]
@@ -274,4 +274,4 @@ resolveLineCol src wh =
 
              lastLine = T.dropWhileEnd (`notElem` "\r\n\f") upTilHere
          in (ptpNewlines l'Measure + countNewlines lastLine, fromIntegral (T.length upTilHere - T.length lastLine))
-       FingerTree.EmptyL -> trace ("Got src " ++ show (src, l, r)) (0, 0)
+       FingerTree.EmptyL -> (0, 0)

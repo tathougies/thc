@@ -18,3 +18,8 @@ executable thc-test-parse
         hs-source-dir: apps
         main-is: TestHsParse.hs
         build-depends: base, thc-parser, thc-lexer, cyk
+
+executable thc-print-parsing-tbl
+        hs-source-dir: apps
+        main-is: PrintParseTbl.hs
+        build-depends: base, thc-parser, cyk

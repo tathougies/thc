@@ -3,6 +3,8 @@ module Main where
 import Language.Haskell.THC.Syntax.Parser
 import Language.Haskell.THC.Syntax.SourceFile
 
+import Control.Monad
+
 import Data.Foldable
 
 import System.Environment
@@ -20,3 +22,5 @@ main = do
   putStrLn ("There were " ++ show (length res) ++ " parse(s)")
   forM_ res $ \res' ->
       putStrLn (show res')
+
+  printParsedTableau parsed

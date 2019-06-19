@@ -14,6 +14,8 @@ module Text.CYK.Parser
   ( Splittable(..), SplitResult(..)
 
   , Parsed, Parser, getParseResult
+  , parserFinal
+  , printParsedTableau
   , parse, testParse, combineParses
   , ParserBuilder, RuleB, buildRule
   , compile, terminal, rule
@@ -22,19 +24,24 @@ module Text.CYK.Parser
   , simpleParser
   , simpleRuleParser
   , simpleRuleParserLR
+  , showRules
   ) where
 
 import           Control.Applicative
+import           Control.Monad.ST
 import           Control.Monad.State
 import           Control.Parallel (par)
 import           Control.Parallel.Strategies (Strategy, withStrategy, r0, rseq, runEval)
 
-import           Data.Foldable (foldl')
+import           Data.Foldable (foldl', foldrM)
+import qualified Data.IntMap as IM
+import           Data.List (sortBy)
+import           Data.Ord (comparing)
+import qualified Data.Sequence as Seq
 import qualified Data.Vector as V
 import qualified Data.Vector.Generic as GV
 import qualified Data.Vector.Unboxed as UV
-import qualified Data.Sequence as Seq
-import qualified Data.IntMap as IM
+import qualified Data.Vector.Mutable as MV
 
 import           Data.Bits ((.|.), (.&.), shiftL, shiftR)
 import           Data.Foldable (toList)
@@ -43,6 +50,7 @@ import qualified Data.Map.Strict as M
 import           Data.Maybe (fromMaybe, mapMaybe)
 import           Data.Monoid (Last(..), Sum(..))
 import qualified Data.Monoid as Monoid
+import           Data.Semigroup (Max(..))
 import qualified Data.Text as T
 import           Data.Word
 
@@ -52,6 +60,7 @@ import qualified Data.FingerTree.Pinky as FingerTree
 --import           Debug.Trace
 import qualified Debug.Trace as Trace
 
+import           GHC.Stack
 import           GHC.Types (Any)
 
 import           Unsafe.Coerce
@@ -584,15 +593,19 @@ bsearch vs k = loop 0 (GV.length vs)
 productionPair :: Word32 -> Word32 -> Word64
 productionPair a b = (fromIntegral a `shiftL` 32) .|. fromIntegral b
 
+decomposePair :: Word64 -> (Word32, Word32)
+decomposePair a = (fromIntegral (a `shiftR` 32), fromIntegral (a .&. 0xFFFFFFFF))
+
 -- Parser building
 
 data GenericRuleSpec = GenericRuleSpec {-# UNPACK #-} !Word64 {-# UNPACK #-} !Word32 (Any -> Any -> Any)
-data SingleProductionSpec tok = SingleProductionSpec {-# UNPACK #-} !Word32 {-# UNPACK #-} !Word32 (tok -> Any)
+data SingleProductionSpec tok = SingleProductionSpec { spsCls, spsDest :: {-# UNPACK #-} !Word32
+                                                     , spsMk :: tok -> Any }
 
 instance Measured (Last Word64) GenericRuleSpec where
   measure (GenericRuleSpec a _ _) = Last (Just a)
 instance Measured (Last Word32) (SingleProductionSpec tok) where
-  measure (SingleProductionSpec a _ _) = Last (Just a)
+  measure sps = Last (Just (spsCls sps))
 
 newtype ParserBuilder tok classification a
   = ParserBuilder (State (Word32,
@@ -616,8 +629,66 @@ addRuleSpec s ft =
       (a, b) = FingerTree.split (\(Last k) -> fromMaybe False $ do
                                                 k' <- k
                                                 lastS' <- lastS
-                                                pure (lastS' < k')) ft
+                                                pure (lastS' <= k')) ft
   in (a FingerTree.|> s) FingerTree.>< b
+
+simplifyParser :: HasCallStack => Parser tok a -> Parser tok a
+simplifyParser p = runST $ do
+
+  singleMarks <- MV.replicate (V.length (parserSingleRules p)) False
+  seqMarks <- MV.replicate (UV.length (parserRules p)) False
+
+  let Max maxRule = foldMap (Max . fst . snd) (parserSingleRules p) <>
+                    foldMap (Max . snd) (UV.toList (parserRules p))
+  seen <- MV.replicate (fromIntegral maxRule + 1) False
+  MV.write seen (fromIntegral $ parserFinal p) True
+
+  let cullRules = do
+        validSingleIndices <- V.findIndices id <$> V.freeze singleMarks
+        validSeqIndices <- V.findIndices id <$> V.freeze seqMarks
+
+        pure ( V.backpermute (parserSingleRules p) validSingleIndices
+             , UV.backpermute (parserRules p) (UV.fromList (V.toList validSeqIndices))
+             , V.backpermute (parserCombinators p) validSeqIndices )
+
+      mark [] = cullRules
+      mark (nextRule:rules) = do
+        forM_ (V.indexed (parserSingleRules p)) $ \(i, (_, (dst, _))) ->
+          when (dst == nextRule) $
+            markSingle i
+
+        rules' <-
+           foldrM (\(i, (seq, dst)) rules' ->
+                     if dst == nextRule
+                     then do
+                       let (left, right) = decomposePair seq
+                       rules'' <- visit left rules'
+                       rules''' <- visit right rules''
+                       markSeq i
+                       pure rules'''
+                     else pure rules')
+                  rules (zip [0..] (UV.toList (parserRules p)))
+
+        mark rules'
+
+      markSingle i =
+        MV.write singleMarks i True
+      markSeq i =
+        MV.write seqMarks i True
+
+      visit n rules = do
+        alreadySeen <- MV.read seen (fromIntegral n)
+        if alreadySeen then pure rules
+          else do
+            MV.write seen (fromIntegral n) True
+            pure (n:rules)
+
+  (single', rules', combinators) <- mark [parserFinal p]
+
+  pure p { parserSingleRules = single'
+         , parserRules = rules'
+         , parserCombinators = combinators }
+
 
 compile :: forall tok classification a
          . (Enum classification, Bounded classification)
@@ -626,12 +697,14 @@ compile classifier (ParserBuilder build) =
   let (Rule always _ (RuleIx final), (_, transitionMap, singles)) = runState build (0, mempty, mempty)
 
       (transitions, combinators) = unzip (map (\(GenericRuleSpec p n f) -> ((p, n), f)) (toList transitionMap))
-      singlesRules = map (\(SingleProductionSpec cls dest fn) -> (cls, (dest, fn))) (toList singles)
-  in Parser classifier (V.fromList singlesRules)
+      singlesRules = map (\(SingleProductionSpec { spsCls = cls, spsDest = dest, spsMk = fn }) -> (cls, (dest, fn))) (toList singles)
+
+  in simplifyParser $
+     Parser classifier (V.fromList singlesRules)
          (UV.fromList transitions)
          (V.fromList combinators) final always
 
-newtype RuleIx a = RuleIx Word32
+newtype RuleIx a = RuleIx Word32 deriving Show
 
 production :: Enum cls
            => ParserBuilder tok cls (RuleIx a)
@@ -645,7 +718,8 @@ production = ParserBuilder $ do
 RuleIx nm <=. (cls, mk) =
     ParserBuilder $ do
       (nextNm, trans, prods) <- get
-      put (nextNm, trans, addRuleSpec (SingleProductionSpec (fromIntegral (fromEnum cls)) nm (\a -> unsafeCoerce (mk a))) prods)
+      put (nextNm, trans, addRuleSpec (SingleProductionSpec { spsCls = fromIntegral (fromEnum cls), spsDest = nm
+                                                            , spsMk = \a -> unsafeCoerce (mk a) }) prods)
       pure ()
 
 (<=*) :: RuleIx c -> (a -> b -> c, RuleIx a, RuleIx b) -> ParserBuilder token classification ()
@@ -701,7 +775,7 @@ getTestParsed pp s = parse 50 pp (T.pack s)
 getTestParsedText :: Parser Char a -> T.Text -> Parsed Char a
 getTestParsedText pp = parse 50 pp
 
-printParsedTableau :: Parsed Char a -> IO ()
+printParsedTableau :: Parsed tok a -> IO ()
 printParsedTableau (Parsed tbl _) = go tbl
     where
       go cur =
@@ -776,7 +850,7 @@ buildRule rule =
       deAlt (Embed mk) = [ Embed mk ]
 
       getRule :: Enum cls => (a -> b) -> RuleB tok cls a -> ParserBuilder tok cls (MappedRule tok cls b)
-      getRule fmapped (EmbedRule (Rule xs _ w)) = pure (MappedRule fmapped (fmapped <$> xs) w)
+      getRule fmapped (EmbedRule ~(Rule xs _ w)) = pure (MappedRule fmapped (fmapped <$> xs) w)
       getRule fmapped (Ap (Pure fn) a) =
         getRule (fmapped . fn) a
       getRule fmapped x = do
@@ -814,10 +888,11 @@ buildRule rule =
                    rule <=* (\f x -> fmapped ((fnMap f) (xMap x)), fnRule, xRule)
                    pure (fmapped <$> (fns <*> xs))
 
-      produceRule fmapped (EmbedRule (Rule _ build _)) rule = do
+      produceRule fmapped (EmbedRule ~(Rule _ build _)) rule = do
         let alts = deAlt build
         empties <- mconcat <$> mapM (\r -> produceRule fmapped r rule) alts
         return empties
+
       produceRule fmapped (Embed mk) rule = do
         mk fmapped rule
         pure []
@@ -904,11 +979,12 @@ showTableauCell :: TableauCell tok -> String
 showTableauCell (TableauRowSkip n) = "<" ++ show n ++ ">"
 showTableauCell (TableauCell x) = show (fmap fst x)
 
-showRules :: Parser tok a -> IO ()
-showRules pp = do
-  forM_ (parserSingleRules pp) $ \(cls, (nxt, _)) ->
-    putStrLn (show nxt ++ " -> `" ++ show cls ++ "`")
-  forM_ (UV.toList (parserRules pp)) $ \(seq, nxt) ->
-    let left = seq `shiftR` 32
-        right = seq .&. 0xFFFFFFFF
-    in putStrLn (show nxt ++ " -> " ++ show left ++ " " ++ show right)
+showRules :: (Word32 -> String) -> Parser tok a -> IO ()
+showRules showCls pp = do
+  let rules = map (\(cls, (nxt, _)) -> (nxt, "`" ++ showCls cls ++ "`")) (toList (parserSingleRules pp)) ++
+              map (\(seq, nxt) -> let left = seq `shiftR` 32
+                                      right = seq .&. 0xFFFFFFFF
+                                  in (nxt, show left ++ " " ++ show right)) (UV.toList (parserRules pp))
+
+  forM_ (sortBy (comparing fst) rules) $ \(nxt, what) ->
+    putStrLn (show nxt ++ " -> " ++ what)
