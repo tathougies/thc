@@ -13,7 +13,7 @@ library
         exposed-modules: Text.CYK.Parser
         other-modules: Text.CYK.FingerTree
         ghc-options: -O2 -threaded
-        build-depends: base, pinky, text, mtl, ghc-prim, vector, containers, parallel, dump-core, transformers
+        build-depends: base, pinky, text, mtl, ghc-prim, vector, containers, parallel, dump-core, transformers, dependent-map, dependent-sum
 
 executable test-cyk-expr
         hs-source-dir: tests

@@ -3,5 +3,5 @@ with nixpkgs;
 
 stdenv.mkDerivation {
   name = "thc";
-  buildInputs = [ (ghc.ghcWithPackages (ps: with ps; [ text haskell-lsp ansi-terminal containers fingertree Cabal dump-core ])) cabal-install ];
+  buildInputs = [ (ghc.ghcWithPackages (ps: with ps; [ text haskell-lsp ansi-terminal containers fingertree Cabal dump-core dependent-map ])) cabal-install ];
 }

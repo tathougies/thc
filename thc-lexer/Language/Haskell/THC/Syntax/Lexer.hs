@@ -51,6 +51,7 @@ data ThcLexemeC
     | ThcLexemeIn
     | ThcLexemeThen
     | ThcLexemeElse
+    | ThcLexemeBang
     | ThcLexemeData
     | ThcLexemeType
     | ThcLexemeNewtype
@@ -201,6 +202,7 @@ lexer = "case"     $=> ThcLexemeSimple ThcLexemeCase
     ||| "infix"    $=> ThcLexemeSimple ThcLexemeInfix
     ||| "--"       $=> ThcLexemeCommentStart
     ||| "{-"       $=> ThcLexemeMLCommentStart
+    ||| "!"        $=> ThcLexemeSimple ThcLexemeBang
     ||| "("        $=> ThcLexemeSimple ThcLexemeOpenParen
     ||| ")"        $=> ThcLexemeSimple ThcLexemeCloseParen
     ||| "|"        $=> ThcLexemeSimple ThcLexemeBar

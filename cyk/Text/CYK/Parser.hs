@@ -1,4 +1,7 @@
 {-# OPTIONS_GHC -fplugin DumpCore #-}
+{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE MagicHash #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -18,10 +21,10 @@ module Text.CYK.Parser
   , printParsedTableau
   , parse, testParse, combineParses
   , ParserBuilder, RuleB, buildRule
-  , compile, terminal, rule
+  , compile, terminal
 
   , Sym, AST(..)
-  , simpleParser
+--  , simpleParser
   , simpleRuleParser
   , simpleRuleParserLR
   , showRules
@@ -35,17 +38,20 @@ import           Control.Parallel.Strategies (Strategy, withStrategy, r0, rseq, 
 
 import           Data.Foldable (foldl', foldrM)
 import qualified Data.IntMap as IM
-import           Data.List (sortBy)
+import           Data.List (sortBy, intercalate)
 import           Data.Ord (comparing)
 import qualified Data.Sequence as Seq
 import qualified Data.Vector as V
 import qualified Data.Vector.Generic as GV
 import qualified Data.Vector.Unboxed as UV
 import qualified Data.Vector.Mutable as MV
+import qualified Data.Dependent.Map as DM
+import qualified Data.GADT.Compare as DM
 
 import           Data.Bits ((.|.), (.&.), shiftL, shiftR)
 import           Data.Foldable (toList)
 import           Data.Int
+import           Data.List (find)
 import qualified Data.Map.Strict as M
 import           Data.Maybe (fromMaybe, mapMaybe)
 import           Data.Monoid (Last(..), Sum(..))
@@ -60,6 +66,7 @@ import qualified Data.FingerTree.Pinky as FingerTree
 --import           Debug.Trace
 import qualified Debug.Trace as Trace
 
+import           GHC.Prim
 import           GHC.Stack
 import           GHC.Types (Any)
 
@@ -83,7 +90,7 @@ data SplitResult f a
 data Parser tok a where
   Parser :: Enum classification
          => { parserTokenClassifier   :: tok -> classification
-            , parserSingleRules       :: V.Vector (Word32, (Word32, tok -> Any))
+            , parserSingleRules       :: V.Vector (Word32, (Word32, tok -> Maybe Any))
             , parserRules             :: UV.Vector (Word64, Word32)
             , parserCombinators       :: V.Vector (Any -> Any -> Any)
             , parserFinal             :: {-# UNPACK #-} !Word32 -- Final state
@@ -190,7 +197,7 @@ makeEntireTableau pp@Parser { parserSingleRules = singles, parserTokenClassifier
       let prod = fromIntegral (fromEnum (classify tok))
           prodStart = bsearch singles prod
           applicableProductions = V.takeWhile ((== prod) . fst) (V.drop prodStart singles)
-          newProductions = V.map (\(_, (next, mk)) -> (next, mk tok)) applicableProductions
+          newProductions = V.mapMaybe (\(_, (next, mk)) -> (next,) <$> mk tok) applicableProductions
 
       in if V.null newProductions
          then initialRow (n + 1) toks
@@ -607,14 +614,21 @@ instance Measured (Last Word64) GenericRuleSpec where
 instance Measured (Last Word32) (SingleProductionSpec tok) where
   measure sps = Last (Just (spsCls sps))
 
+data ProdSpec tok cls a
+  = ProdSpec
+  { psRule :: RuleIx a
+  , psBuild :: RuleB tok cls a
+  , psDerivedFrom :: DM.DMap ProdIx (Const ())
+  }
+
 newtype ParserBuilder tok classification a
-  = ParserBuilder (State (Word32,
-                          FingerTree (Last Word64) GenericRuleSpec,
-                          FingerTree (Last Word32) (SingleProductionSpec tok)) a)
+  = ParserBuilder { runParserBuilder ::
+                      State (Word32, Word32,
+                             DM.DMap ProdIx (ProdSpec tok classification)) a }
   deriving (Functor, Monad, MonadFix, Applicative)
 
-data Rule tok cls a
-  = Rule [a] (RuleB tok cls a) (RuleIx a)
+--data Rule tok cls a
+--  = Rule [a] (RuleB tok cls a) (RuleIx a)
 
 data Keyed k v = Keyed k v deriving Show
 
@@ -689,47 +703,338 @@ simplifyParser p = runST $ do
          , parserRules = rules'
          , parserCombinators = combinators }
 
-
 compile :: forall tok classification a
          . (Enum classification, Bounded classification)
-        => (tok -> classification) -> ParserBuilder tok classification (Rule tok classification a) -> Parser tok a
+        => (tok -> classification) -> ParserBuilder tok classification (RuleB tok classification a) -> Parser tok a
 compile classifier (ParserBuilder build) =
-  let (Rule always _ (RuleIx final), (_, transitionMap, singles)) = runState build (0, mempty, mempty)
+    let buildRules = do
+          startRuleB <- build
 
-      (transitions, combinators) = unzip (map (\(GenericRuleSpec p n f) -> ((p, n), f)) (toList transitionMap))
-      singlesRules = map (\(SingleProductionSpec { spsCls = cls, spsDest = dest, spsMk = fn }) -> (cls, (dest, fn))) (toList singles)
+          (nextRule, nextProd, rules) <- get
+          let startAlts = map (\r -> ProdSpec startRule r DM.empty) (deAlt startRuleB)
+              startRule = RuleIx nextRule
+          put ( nextRule + 1, nextProd + fromIntegral (length startAlts)
+              , foldr (uncurry DM.insert) rules (zip (map ProdIx [nextProd..]) startAlts) )
 
-  in simplifyParser $
-     Parser classifier (V.fromList singlesRules)
-         (UV.fromList transitions)
-         (V.fromList combinators) final always
+          runParserBuilder removeMany
+          runParserBuilder liftTerminals
+          runParserBuilder elimBin
+          runParserBuilder inlineConstants -- DEL rlue
+          runParserBuilder inlineSingletons -- UNIT rule
 
-newtype RuleIx a = RuleIx Word32 deriving Show
+          pure startRule
 
-production :: Enum cls
-           => ParserBuilder tok cls (RuleIx a)
-production = ParserBuilder $ do
-               (nextNm, trans, prods) <- get
-               put (nextNm + 1, trans, prods)
-               pure (RuleIx nextNm)
+        (RuleIx startRuleIx, (_, _, rules)) = runState buildRules (0, 0, DM.empty)
 
-(<=.) :: Enum classification
-      => RuleIx a -> (classification, token -> a) -> ParserBuilder token classification ()
-RuleIx nm <=. (cls, mk) =
-    ParserBuilder $ do
-      (nextNm, trans, prods) <- get
-      put (nextNm, trans, addRuleSpec (SingleProductionSpec { spsCls = fromIntegral (fromEnum cls), spsDest = nm
-                                                            , spsMk = \a -> unsafeCoerce (mk a) }) prods)
-      pure ()
+        ruleList = DM.toAscList rules
 
-(<=*) :: RuleIx c -> (a -> b -> c, RuleIx a, RuleIx b) -> ParserBuilder token classification ()
-RuleIx nm <=* (cmb, RuleIx l, RuleIx r) =
-    ParserBuilder $ do
-      (nextNm, trans, prods) <- get
-      put (nextNm,
-           addRuleSpec (GenericRuleSpec (productionPair l r) nm (\a b -> unsafeCoerce (cmb (unsafeCoerce a) (unsafeCoerce b)))) trans,
-           prods)
-      pure ()
+        singles = V.fromList . sortBy (comparing fst) $ do
+          _ DM.:=> ProdSpec (RuleIx rule) (Ap (Pure fn) (Terminal cls mkTok)) _ <- ruleList
+          pure ( fromIntegral (fromEnum cls), (rule, fmap (fmap (unsafeCoerce . fn)) mkTok) )
+
+        (trans, combinators) = unzip .
+                               sortBy (comparing (fst . fst)) $
+                               [ ( (productionPair xIx yIx, ruleIx )
+                                       , \x y -> unsafeCoerce (fn (unsafeCoerce x) (unsafeCoerce y)) )
+                               | _ DM.:=> ProdSpec (RuleIx ruleIx)
+                                            (Ap (Ap (Pure fn) (EmbedRule (RuleIx xIx)))
+                                                (EmbedRule (RuleIx yIx))) _ <- ruleList ]
+
+    in simplifyParser $
+       Parser { parserTokenClassifier = classifier
+              , parserSingleRules = singles
+              , parserFinal = startRuleIx
+              , parserCombinators = V.fromList combinators
+              , parserRules = UV.fromList trans
+              , parserEmptyMatches = [] {- TODO empty matches -} }
+
+reallyReallyUnsafeOptimizationEquality :: a -> b -> Bool
+reallyReallyUnsafeOptimizationEquality a b =
+  case reallyUnsafePtrEquality# a (unsafeCoerce# b) of
+    0# -> False
+    _  -> True
+
+data SomeMaker tok where
+  SomeMaker :: (tok -> Maybe a) -> SomeMaker tok
+
+liftTerminals :: Enum cls => ParserBuilder tok cls ()
+liftTerminals = do
+  (_, _, rules) <- ParserBuilder get
+
+  (rules', _) <- flip runStateT M.empty $
+                 DM.traverseWithKey (\x ps -> do
+                                        prod' <- liftProdTerminal (psBuild ps)
+                                        pure (ps { psBuild = prod' })) rules
+
+  ParserBuilder (modify (\(nextRule, nextProd, rules'') -> (nextRule, nextProd, DM.union rules' rules'')))
+
+  where
+    liftProdTerminal :: Enum cls => RuleB tok cls a
+                     -> StateT (M.Map Int [(SomeMaker tok, Word32)])
+                               (ParserBuilder tok cls) (RuleB tok cls a)
+    liftProdTerminal (Ap fn x) = Ap <$> liftProdTerminal fn <*> liftProdTerminal x
+    liftProdTerminal (Many x)  = Many <$> liftProdTerminal x
+    liftProdTerminal (Terminal cls mk) = do
+      terms <- get
+      case M.lookup (fromEnum cls) terms of
+        Just makers
+          | Just (_, rule) <- find (\(SomeMaker mkr, _) -> reallyReallyUnsafeOptimizationEquality mkr mk) makers -> pure (EmbedRule (RuleIx rule))
+        found -> do
+          (nextRule, nextProd, _) <- lift (ParserBuilder get)
+          let makers = fromMaybe [] found
+              makers' = (SomeMaker mk, nextRule):makers
+          lift (ParserBuilder (modify (\(nextRule, _, rules) -> (nextRule + 1, nextProd + 1, DM.insert (ProdIx nextProd) (ProdSpec (RuleIx nextRule) (Terminal cls mk) DM.empty) rules))))
+          modify (M.insert (fromEnum cls) makers')
+          pure (EmbedRule (RuleIx nextRule))
+    liftProdTerminal x = pure x
+
+removeMany :: ParserBuilder tok cls ()
+removeMany = do
+  (_, _, rules) <- ParserBuilder get
+
+  rules' <-
+    DM.traverseWithKey (\_ prod -> do
+                           prod' <- removeMany (psBuild prod)
+                           pure (prod { psBuild = prod' })) rules
+
+  ParserBuilder (modify (\(nextRule, nextProd, rules'') -> (nextRule, nextProd, DM.union rules' rules'')))
+  where
+    removeMany :: RuleB tok cls a -> ParserBuilder tok cls (RuleB tok cls a)
+    removeMany (Ap f x) = Ap <$> removeMany f <*> removeMany x
+    removeMany (Many f) = do
+      (nextRule, nextProd, rules) <- ParserBuilder get
+      ParserBuilder (put (nextRule + 2, nextProd + 3, rules))
+
+      f' <- removeMany f
+
+      ParserBuilder $ modify $ \(nextRule', nextProd', rules') ->
+        let rules'' = DM.insert (ProdIx nextProd) (ProdSpec ruleIx (Pure []) DM.empty) $
+                      DM.insert (ProdIx (nextProd + 1)) (ProdSpec ruleIx (Ap (Ap (Pure (:)) (EmbedRule elemRuleIx)) (EmbedRule ruleIx)) DM.empty)  $
+                      DM.insert (ProdIx (nextProd + 2)) (ProdSpec elemRuleIx f' DM.empty) $
+                      rules'
+
+            elemRuleIx = RuleIx (nextRule + 1)
+            ruleIx = RuleIx nextRule
+        in (nextRule', nextProd', rules'')
+
+      pure (EmbedRule (RuleIx nextRule))
+    removeMany x = pure x
+
+data SeparatedRule tok cls a where
+  SeparatedRule :: (a -> b) -> RuleB tok cls a -> SeparatedRule tok cls b
+
+elimBin :: ParserBuilder tok cls ()
+elimBin = do
+  (_, _, rules) <- ParserBuilder get
+
+  rules' <-
+    DM.traverseWithKey (\_ prod -> do
+                           prod' <- elimBinProd id (psBuild prod)
+                           pure (prod { psBuild = prod' })) rules
+
+  ParserBuilder (modify (\(nextRule, nextProd, rules'') -> (nextRule, nextProd, DM.union rules' rules'')))
+  where
+    elimBinProd :: (b -> c) -> RuleB tok cls b -> ParserBuilder tok cls (RuleB tok cls c)
+    elimBinProd f (Pure a) =
+      pure (Pure (f a))
+    elimBinProd f (EmbedRule ix) =
+      pure (Ap (Pure f) (EmbedRule ix))
+    elimBinProd f (Ap (Pure fn) x) =
+      elimBinProd (f . fn) x
+    elimBinProd f (Ap (Ap (Pure fn) x) y) = do
+      SeparatedRule transformX xRule <- separateRule id x
+      SeparatedRule transformY yRule <- separateRule id y
+      case (xRule, yRule) of
+        (Pure x', Pure y') ->
+          pure (Pure (f (fn (transformX x') (transformY y'))))
+        (Pure x', _) ->
+          pure (Ap (Pure (\y' -> f (fn (transformX x') (transformY y')))) yRule)
+        (_, Pure y') ->
+          pure (Ap (Pure (\x' -> f (fn (transformX x') (transformY y')))) xRule)
+        _ ->
+          pure (Ap (Ap (Pure (\x' y' -> f (fn (transformX x') (transformY y')))) xRule) yRule)
+    elimBinProd f (Ap fn x) = do
+      SeparatedRule transformFn fnRule <- separateRule id fn
+      SeparatedRule transformX  xRule  <- separateRule id x
+      case (fnRule, xRule) of
+        (Pure fn', Pure x') ->
+          pure (Pure (f ((transformFn fn') (transformX x'))))
+        (Pure fn', _) ->
+          pure (Ap (Pure (\x' -> f ((transformFn fn') (transformX x')))) xRule)
+        (_, Pure x') ->
+          pure (Ap (Pure (\fn' -> f ((transformFn fn') (transformX x')))) fnRule)
+        _ ->
+          pure (Ap (Ap (Pure (\fn' x' -> f ((transformFn fn') (transformX x')))) fnRule) xRule)
+    elimBinProd f x =
+      pure (Ap (Pure f) x)
+
+    separateRule :: (b -> c) -> RuleB tok cls b -> ParserBuilder tok cls (SeparatedRule tok cls c)
+    separateRule f (Pure x) =
+      pure (SeparatedRule f (Pure x))
+    separateRule f (Ap (Pure fn) x) =
+      separateRule (f . fn) x
+    separateRule f (EmbedRule ruleIx) =
+      pure (SeparatedRule f (EmbedRule ruleIx))
+    separateRule f rule = do
+      -- Allocate new rule
+      rule' <- elimBinProd f rule
+      case rule' of
+        Pure x -> pure (SeparatedRule id rule')
+        _ -> do
+          (nextRule, _, _) <- ParserBuilder get
+          let nextRuleIx = RuleIx nextRule
+          ParserBuilder (modify (\(nextRule, nextProd, rules) ->
+                                   (nextRule + 1, nextProd + 1,
+                                    DM.insert (ProdIx nextProd) (ProdSpec nextRuleIx rule' DM.empty) rules)))
+          pure (SeparatedRule id (EmbedRule nextRuleIx))
+
+rewrite :: (forall a. Word32 -> DM.DMap ProdIx (ProdSpec tok cls) -> ProdIx a -> ProdSpec tok cls a -> ParserBuilder tok cls (ProdSpec tok cls a))
+        -> ParserBuilder tok cls ()
+rewrite doRewrite = go 0
+  where
+    go startProd =  do
+      (_, lastProd, _) <- ParserBuilder get
+
+      onePass startProd
+
+      (_, lastProd', _) <- ParserBuilder get
+
+      if lastProd' == lastProd
+        then pure ()
+        else go lastProd
+
+    onePass startProd = do
+      (_, _, rules) <- ParserBuilder get
+
+      DM.traverseWithKey (doRewrite startProd rules) rules
+
+inlineConstants :: ParserBuilder tok cls ()
+inlineConstants = rewrite rewriteLit >> removeAllConstants
+  where
+    removeAllConstants :: ParserBuilder tok cls ()
+    removeAllConstants =
+      ParserBuilder $ do
+        modify (\(rule, prod, rs) -> (rule, prod, DM.filterWithKey (\_ (ProdSpec _ rule _) -> case rule of { Pure {} -> False; _ -> True }) rs))
+
+    rewriteLit :: Word32 -> DM.DMap ProdIx (ProdSpec tok cls)
+               -> ProdIx a -> ProdSpec tok cls a -> ParserBuilder tok cls (ProdSpec tok cls a)
+    rewriteLit startFrom rules prodIx rule =
+      case psBuild rule of
+        Ap (Pure fn) x -> do
+          forM_ (lookupLits startFrom rules x) $ \(xSpec, xLit) ->
+            addSpec rule xSpec (Pure (fn xLit))
+          pure rule
+        Ap (Ap (Pure fn) x) y -> do
+          let xLits = lookupLits startFrom rules x
+              yLits = lookupLits startFrom rules y
+          forM_ xLits $ \(fromSpec, xLit) ->
+            addSpec rule fromSpec (Ap (Pure (fn xLit)) y)
+          forM_ yLits $ \(fromSpec, yLit) ->
+            addSpec rule fromSpec (Ap (Pure (\x -> fn x yLit)) x)
+          forM_ ((,) <$> xLits <*> yLits) $ \((xSpec, xLit), (ySpec, yLit)) ->
+            addSpec rule (DM.union xSpec ySpec) (Pure (fn xLit yLit))
+          pure rule
+        _ -> pure rule
+
+    addSpec :: ProdSpec tok cls a -> DM.DMap ProdIx (Const ()) -> RuleB tok cls a -> ParserBuilder tok cls ()
+    addSpec origSpec newDeps newProd = do
+      ParserBuilder $ do
+        (_, lastProd, _) <- get
+        modify (\(rule, prod, rs) -> (rule, prod + 1, DM.insert (ProdIx lastProd) (ProdSpec (psRule origSpec) newProd (DM.union (psDerivedFrom origSpec) newDeps)) rs))
+
+    lookupLits :: Word32 -> DM.DMap ProdIx (ProdSpec tok cls) -> RuleB tok cls a -> [ (DM.DMap ProdIx (Const ()), a) ]
+    lookupLits startFrom rules (EmbedRule ruleIx) =
+      [ (newDeps, x)
+      | ProdIx thisProdIx DM.:=> ProdSpec (DM.geq ruleIx -> Just DM.Refl) (Pure x) newDeps <- DM.toList rules
+      , thisProdIx >= startFrom ]
+    lookupLits startFrom rules _ = []
+
+data UsefulProduction tok cls c where
+  UsefulProduction :: (a -> b -> c) -> RuleB tok cls a -> RuleB tok cls b -> UsefulProduction tok cls c
+  UsefulTerminal :: (a -> b) -> cls -> (tok -> Maybe a) -> UsefulProduction tok cls b
+
+inlineSingletons :: ParserBuilder tok cls ()
+inlineSingletons = rewrite rewriteUnit >> removeAllUnits
+  where
+    removeAllUnits :: ParserBuilder tok cls ()
+    removeAllUnits =
+      ParserBuilder $
+      modify (\(rule, prod, rs) -> (rule, prod, DM.filterWithKey (\_ -> not . isUnit) rs))
+
+    isUnit :: ProdSpec tok cls a -> Bool
+    isUnit a = countRules (psBuild a) == 1
+
+    countRules :: RuleB tok cls a -> Int
+    countRules (Ap a b) = countRules a + countRules b
+    countRules (Pure {}) = 0
+    countRules (EmbedRule {}) = 1
+    countRules (Alt a b) = countRules a + countRules b
+    countRules (Many a) = countRules a
+    countRules Empty = 0
+    countRules (Terminal {}) = 0
+
+    rewriteUnit :: Word32 -> DM.DMap ProdIx (ProdSpec tok cls)
+                -> ProdIx a -> ProdSpec tok cls a -> ParserBuilder tok cls (ProdSpec tok cls a)
+    rewriteUnit startFrom rules prodIx rule =
+      case psBuild rule of
+        Ap (Pure fn) (EmbedRule x) -> do
+          let xProds = lookupUsefulProductions startFrom rules x
+          forM_ xProds $ \prod ->
+            case prod of
+              UsefulProduction cmb a b ->
+                addSpec rule (Ap (Ap (Pure (\x y -> fn (cmb x y))) a) b)
+              UsefulTerminal fn' cls mk ->
+                addSpec rule (Ap (Pure (fn . fn')) (Terminal cls mk))
+          pure rule
+
+        EmbedRule x -> do
+          rewriteUnit startFrom rules prodIx (rule { psBuild = Ap (Pure id) (EmbedRule x) })
+
+        _ -> pure rule
+
+    addSpec :: ProdSpec tok cls a -> RuleB tok cls a -> ParserBuilder tok cls ()
+    addSpec orig newRule =
+      ParserBuilder $ do
+      modify (\(rule, prod, rs) -> (rule, prod + 1, DM.insert (ProdIx prod) (ProdSpec (psRule orig) newRule (psDerivedFrom orig)) rs))
+
+    lookupUsefulProductions :: Word32 -> DM.DMap ProdIx (ProdSpec tok cls)
+                            -> RuleIx a -> [ UsefulProduction tok cls a ]
+    lookupUsefulProductions startFrom rules whichRule =
+      [ UsefulProduction fn x y
+      | ProdIx thisProdIx DM.:=> ProdSpec (DM.geq whichRule -> Just DM.Refl) (Ap (Ap (Pure fn) x) y) _
+           <- DM.toAscList rules
+      , thisProdIx >= startFrom ] ++
+      [ UsefulTerminal fn cls mk
+      | ProdIx thisProdIx DM.:=> ProdSpec (DM.geq whichRule -> Just DM.Refl) (Ap (Pure fn) (Terminal cls mk)) _
+           <- DM.toAscList rules
+      , thisProdIx >= startFrom ]
+
+newtype RuleIx a = RuleIx { unRuleIx :: Word32 } deriving Show
+newtype ProdIx a = ProdIx Word32 deriving Show
+
+instance DM.GEq ProdIx where
+  geq (ProdIx a) (ProdIx b)
+    | a == b = Just (unsafeCoerce DM.Refl)
+    | otherwise = Nothing
+
+instance DM.GEq RuleIx where
+  geq (RuleIx a) (RuleIx b)
+    | a == b = Just (unsafeCoerce DM.Refl)
+    | otherwise = Nothing
+
+instance DM.GCompare ProdIx where
+  gcompare (ProdIx a) (ProdIx b) =
+    case compare a b of
+      LT -> DM.GLT
+      GT -> DM.GGT
+      EQ -> unsafeCoerce DM.GEQ
+
+-- production :: Enum cls
+--            => ParserBuilder tok cls (RuleIx a)
+-- production = ParserBuilder $ do
+--                (nextNm, rules) <- get
+--                put (nextNm + 1, rules)
+--                pure (RuleIx nextNm)
 
 data Sym = A | B | C | Star | Error
   deriving (Show, Enum, Bounded)
@@ -744,24 +1049,24 @@ charToSym _ = Error
 data AST = A' | B' | C' | Mul AST AST
            deriving Show
 
-simpleParser :: Parser Char AST
-simpleParser = compile id $ mdo
-
-  varProd <- production
-
-  varProd <=. ('a', \_ -> A')
-  varProd <=. ('b', \_ -> B')
-  varProd <=. ('c', \_ -> C')
-
-  starProd <- production
-  starProd <=. ('*', \_ -> ())
-
-  mulProd <- production
-  mulProd <=* (\_ b -> trace ("Making b " ++ show b) (\a -> Mul a b), starProd, varProd)
-
-  varProd <=* (\a f -> f a, varProd, mulProd)
-
-  pure (Rule [] Empty varProd)
+-- simpleParser :: Parser Char AST
+-- simpleParser = compile id $ mdo
+-- 
+--   varProd <- production
+-- 
+--   varProd <=. ('a', \_ -> A')
+--   varProd <=. ('b', \_ -> B')
+--   varProd <=. ('c', \_ -> C')
+-- 
+--   starProd <- production
+--   starProd <=. ('*', \_ -> ())
+-- 
+--   mulProd <- production
+--   mulProd <=* (\_ b -> trace ("Making b " ++ show b) (\a -> Mul a b), starProd, varProd)
+-- 
+--   varProd <=* (\a f -> f a, varProd, mulProd)
+-- 
+--   pure (Rule [] Empty varProd)
 
 testParse :: Parser Char a -> String -> [a]
 testParse pp s =
@@ -794,21 +1099,25 @@ printParsedTableau (Parsed tbl _) = go tbl
 
 data RuleB tok cls a where
     Pure :: a -> RuleB tok cls a
-    Embed :: (forall b. (a -> b) -> RuleIx b -> ParserBuilder tok cls ()) -> RuleB tok cls a
-    EmbedRule :: Rule tok cls a -> RuleB tok cls a
+    -- Embed :: (forall b. (a -> b) -> RuleIx b -> ParserBuilder tok cls ()) -> RuleB tok cls a
+    Terminal :: cls -> (tok -> Maybe a) -> RuleB tok cls a
+    EmbedRule :: RuleIx a -> RuleB tok cls a
     Ap :: RuleB tok cls (a -> b) -> RuleB tok cls a -> RuleB tok cls b
 
     Alt :: RuleB tok cls a -> RuleB tok cls a -> RuleB tok cls a
 
-    Many :: RuleB tok cls a -> RuleB tok cls a
+    Many :: RuleB tok cls a -> RuleB tok cls [a]
     Empty :: RuleB tok cls a
 
 instance Functor (RuleB tok cls) where
+    fmap fn (Pure x) = Pure (fn x)
+    fmap fn (Ap fn' b) = Ap (fmap (fmap fn) fn') b
     fmap fn x = Ap (Pure fn) x
 
 instance Applicative (RuleB tok cls) where
     pure = Pure
     Pure fn <*> Pure x = Pure (fn x)
+    a <*> Pure x = fmap ($ x) a
     a <*> b = Ap a b
 
 instance Alternative (RuleB tok cls) where
@@ -817,113 +1126,129 @@ instance Alternative (RuleB tok cls) where
     a <|> b = Alt a b
     empty = Empty
 
+    many = Many
     some x =
       (:) <$> x <*> many x
 
 data MappedRule tok cls a where
   MappedRule :: (b -> a) -> [a] -> RuleIx b -> MappedRule tok cls a
 
-showRuleB :: RuleB tok cls a -> String
+showRuleB :: Enum cls => RuleB tok cls a -> String
 showRuleB (Pure x) = "(Pure _)"
-showRuleB (Embed _) = "(Embed _)"
+showRuleB (Terminal cls _) = "(Terminal " ++ show (fromEnum cls) ++ ")"
 showRuleB (EmbedRule {}) = "EmbedRule"
 showRuleB (Ap fn x) = "(Ap " ++ showRuleB fn ++ " " ++ showRuleB x ++ ")"
 showRuleB (Alt a b) = "(Alt " ++ showRuleB a ++ " " ++ showRuleB b ++ ")"
 showRuleB (Many x) = "(Many " ++ showRuleB x ++ ")"
 showRuleB Empty = "Empty"
 
-buildRule :: Enum cls => RuleB tok cls a -> ParserBuilder tok cls (Rule tok cls a)
+buildRule :: Enum cls => RuleB tok cls a -> ParserBuilder tok cls (RuleB tok cls a)
 buildRule rule =
-    do n <- production
-       let alts = deAlt rule
-       empties <- mconcat <$> mapM (\r -> produceRule id r n) alts
-       return (Rule empties rule n)
+  ParserBuilder $ do
+    (ruleIx, prodIx, prods) <- get
+    let nextRuleIx = RuleIx ruleIx
+        alts = deAlt rule
 
-    where
-      deAlt :: Enum cls => RuleB tok cls a -> [ RuleB tok cls a ]
-      deAlt Empty = []
-      deAlt (Alt a b) =
-        deAlt a ++ deAlt b
-      deAlt (Pure a) = [ Pure a ]
-      deAlt (Ap fn a) = Ap <$> deAlt fn <*> deAlt a
-      deAlt (EmbedRule r) = [ EmbedRule r ]
-      deAlt (Embed mk) = [ Embed mk ]
+        prods' = foldr (\(prodIx', alt') -> DM.insert (ProdIx prodIx') (ProdSpec nextRuleIx alt' DM.empty)) prods (zip [prodIx..] alts)
 
-      getRule :: Enum cls => (a -> b) -> RuleB tok cls a -> ParserBuilder tok cls (MappedRule tok cls b)
-      getRule fmapped (EmbedRule ~(Rule xs _ w)) = pure (MappedRule fmapped (fmapped <$> xs) w)
-      getRule fmapped (Ap (Pure fn) a) =
-        getRule (fmapped . fn) a
-      getRule fmapped x = do
-        pr <- production
-        xs <- produceRule fmapped x pr
-        pure (MappedRule id xs pr)
+    put (ruleIx + 1, prodIx + fromIntegral (length alts), prods')
+    pure (EmbedRule nextRuleIx)
 
-      produceRule :: Enum cls => (a -> b) -> RuleB tok cls a -> RuleIx b -> ParserBuilder tok cls [b]
-      produceRule fmapped (Pure a) _ = pure [ fmapped a ]
-      produceRule fmapped (Ap fn a) rule =
-          case fn of
-            Pure fn ->
-              produceRule (fmapped . fn) a rule
-            Ap (Pure fn) b ->
-                do MappedRule xMap xs xRule <- getRule id b
-                   MappedRule yMap ys yRule <- getRule id a
+deAlt :: Enum cls => RuleB tok cls a -> [ RuleB tok cls a ]
+deAlt Empty = []
+deAlt (Alt a b) = deAlt a ++ deAlt b
+deAlt (Ap fn a) = Ap <$> deAlt fn <*> deAlt a
+deAlt (Many x) = Many <$> deAlt x
+deAlt x = pure x
 
-                   rule <=* (\x y -> fmapped (fn (xMap x) (yMap y)), xRule, yRule)
+--     do n <- production
+--        let alts = deAlt rule
+--        empties <- mconcat <$> mapM (\r -> produceRule id r n) alts
+--        return (Rule empties rule n)
+-- 
+--     where
+--       deAlt :: Enum cls => RuleB tok cls a -> [ RuleB tok cls a ]
+--       deAlt Empty = []
+--       deAlt (Alt a b) =
+--         deAlt a ++ deAlt b
+--       deAlt (Pure a) = [ Pure a ]
+--       deAlt (Ap fn a) = Ap <$> deAlt fn <*> deAlt a
+--       deAlt (EmbedRule r) = [ EmbedRule r ]
+--       deAlt (Embed mk) = [ Embed mk ]
+-- 
+--       getRule :: Enum cls => (a -> b) -> RuleB tok cls a -> ParserBuilder tok cls (MappedRule tok cls b)
+--       getRule fmapped (EmbedRule ~(Rule xs _ w)) = pure (MappedRule fmapped (fmapped <$> xs) w)
+--       getRule fmapped (Ap (Pure fn) a) =
+--         getRule (fmapped . fn) a
+--       getRule fmapped x = do
+--         pr <- production
+--         xs <- produceRule fmapped x pr
+--         pure (MappedRule id xs pr)
+-- 
+--       produceRule :: Enum cls => (a -> b) -> RuleB tok cls a -> RuleIx b -> ParserBuilder tok cls [b]
+--       produceRule fmapped (Pure a) _ = pure [ fmapped a ]
+--       produceRule fmapped (Ap fn a) rule =
+--           case fn of
+--             Pure fn ->
+--               produceRule (fmapped . fn) a rule
+--             Ap (Pure fn) b ->
+--                 do MappedRule xMap xs xRule <- getRule id b
+--                    MappedRule yMap ys yRule <- getRule id a
+-- 
+--                    rule <=* (\x y -> fmapped (fn (xMap x) (yMap y)), xRule, yRule)
+-- 
+--                    yLits <- fmap mconcat . forM ys $ \y ->
+--                      produceRule (fmapped . (\x -> fn x y)) b rule
+--                    xLits <- fmap mconcat . forM xs $ \x ->
+--                      produceRule (fmapped . fn x) a rule
+-- 
+--                    pure (xLits ++ (fmapped <$> (fn <$> xs <*> ys)))
+--             fn ->
+--                 do MappedRule fnMap fns fnRule <- getRule id fn
+--                    MappedRule xMap xs xRule <- getRule id a
+-- 
+--                    forM fns $ \fn ->
+--                      produceRule (fmapped . fn) a rule
+--                    forM xs $ \x ->
+--                      produceRule (fmapped . ($ x)) fn rule
+-- 
+--                    rule <=* (\f x -> fmapped ((fnMap f) (xMap x)), fnRule, xRule)
+--                    pure (fmapped <$> (fns <*> xs))
+-- 
+--       produceRule fmapped (EmbedRule ~(Rule _ build _)) rule = do
+--         let alts = deAlt build
+--         empties <- mconcat <$> mapM (\r -> produceRule fmapped r rule) alts
+--         return empties
+-- 
+--       produceRule fmapped (Embed mk) rule = do
+--         mk fmapped rule
+--         pure []
+-- --      produceRule fmapped (Many x) rule = do
+-- --        produceRule (fmapped (EmbedRule (Rule [[]] (do x <- (pure [] <|> (:) <$> x ) 0))) rule
+--       produceRule _ (Alt {}) _ = fail "produceRule: Alt"
 
-                   yLits <- fmap mconcat . forM ys $ \y ->
-                     produceRule (fmapped . (\x -> fn x y)) b rule
-                   xLits <- fmap mconcat . forM xs $ \x ->
-                     produceRule (fmapped . fn x) a rule
+terminal :: Enum cls => cls -> (tok -> Maybe a) -> RuleB tok cls a
+terminal = Terminal
 
-                   pure (xLits ++ (fmapped <$> (fn <$> xs <*> ys)))
-            fn ->
-                do MappedRule fnMap fns fnRule <- getRule id fn
-                   MappedRule xMap xs xRule <- getRule id a
-
-                   forM fns $ \fn ->
-                     produceRule (fmapped . fn) a rule
-                   forM xs $ \x ->
-                     produceRule (fmapped . ($ x)) fn rule
-
-                   rule <=* (\f x -> fmapped ((fnMap f) (xMap x)), fnRule, xRule)
-                   pure (fmapped <$> (fns <*> xs))
-
-      produceRule fmapped (EmbedRule ~(Rule _ build _)) rule = do
-        let alts = deAlt build
-        empties <- mconcat <$> mapM (\r -> produceRule fmapped r rule) alts
-        return empties
-
-      produceRule fmapped (Embed mk) rule = do
-        mk fmapped rule
-        pure []
---      produceRule fmapped (Many x) rule = do
---        produceRule (fmapped (EmbedRule (Rule [[]] (do x <- (pure [] <|> (:) <$> x ) 0))) rule
-      produceRule _ (Alt {}) _ = fail "produceRule: Alt"
-
-terminal :: Enum cls => cls -> (tok -> a) -> RuleB tok cls a
-terminal cls mk =
-    Embed $ \fn prod -> do
-      prod <=. (cls, fn . mk)
-
-rule :: Rule tok cls a -> RuleB tok cls a
-rule = EmbedRule
+--rule :: RuleIx a -> RuleB tok cls a
+--rule = EmbedRule
 
 simpleRuleParser :: Parser Char AST
 simpleRuleParser = compile id $ mdo
-  varProd <- buildRule (terminal 'a' (\_ -> A') <|>
-                        terminal 'b' (\_ -> B') <|>
-                        terminal 'c' (\_ -> C') <|>
-                        (Mul <$> rule varProd <*> (terminal '*' (\_ -> ()) *> rule varProd)))
+  varProd <- buildRule (terminal 'a' (\_ -> Just A') <|>
+                        terminal 'b' (\_ -> Just B') <|>
+                        terminal 'c' (\_ -> Just C') <|>
+                        (Mul <$> varProd <*> (terminal '*' (\_ -> Just ()) *> varProd)))
   pure varProd
 
 simpleRuleParserLR :: Parser Char AST
 simpleRuleParserLR = compile id $ mdo
-  termProd <- buildRule (terminal 'a' (\_ -> A') <|>
-                         terminal 'b' (\_ -> B') <|>
-                         terminal 'c' (\_ -> C'))
+  termProd <- buildRule (terminal 'a' (\_ -> Just A') <|>
+                         terminal 'b' (\_ -> Just B') <|>
+                         terminal 'c' (\_ -> Just C'))
 
-  varProd <- buildRule (rule termProd <|>
-                        (Mul <$> rule termProd <*> (terminal '*' (\_ -> ()) *> rule varProd)))
+  varProd <- buildRule (termProd <|>
+                        (Mul <$> termProd <*> (terminal '*' (\_ -> Just ()) *> varProd)))
   pure varProd
 
 data LC
@@ -939,39 +1264,39 @@ data Exp
 
 simpleExprParser :: Parser Char Exp
 simpleExprParser = compile id $ mdo
-  let charP c = terminal c id
+  let charP c = terminal c Just
 --      strP = foldr (*>) (pure ()) . map charP
       oneOf s = foldr (<|>) empty (map charP s)
 
   char <- buildRule (oneOf "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQQRSTUVWXYZ0123456789_'")
-  oneChar <- buildRule ( pure <$> rule char )
-  nm <- buildRule ( rule oneChar <|> ( (:) <$> rule char <*> rule nm) )
+  oneChar <- buildRule ( pure <$> char )
+  nm <- buildRule ( oneChar <|> ( (:) <$> char <*> nm) )
 
-  var <- buildRule (VarE <$> rule nm)
+  var <- buildRule (VarE <$> nm)
   plus <- buildRule (charP '+')
 
-  expr <- buildRule ( rule var <|> (Add <$> rule var <*> (rule plus *> rule expr)))
+  expr <- buildRule ( var <|> (Add <$> var <*> (plus *>expr)))
   pure expr
 
 simpleLCParser :: Parser Char LC
 simpleLCParser = compile id $ mdo
-  let charP c = terminal c id
+  let charP c = terminal c Just
 --      strP = foldr (*>) (pure ()) . map charP
       oneOf s = foldr (<|>) empty (map charP s)
 
   char <- buildRule (oneOf "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQQRSTUVWXYZ0123456789_'")
-  nm <- buildRule ( (:) <$> rule char <*> (pure [] <|> rule nm))
+  nm <- buildRule ( (:) <$> char <*> (pure [] <|> nm))
 
   arrow <- buildRule (charP '-' *> charP '>' *> pure ())
   lam <- buildRule (charP '\\')
 
-  ws <- buildRule ( oneOf " \t\r\n\v" *> rule maybeWs )
-  maybeWs <- buildRule ( pure () <|> rule ws )
+  ws <- buildRule ( oneOf " \t\r\n\v" *> maybeWs )
+  maybeWs <- buildRule ( pure () <|> ws )
 
-  lamRule <- buildRule (Lam <$> (rule lam *> rule maybeWs *> rule nm) <*> (rule maybeWs *> rule arrow *> rule maybeWs *> rule expr))
+  lamRule <- buildRule (Lam <$> (lam *> maybeWs *> nm) <*> (maybeWs *> arrow *> maybeWs *> expr))
 
-  bexpr <- buildRule ( (Var <$> rule nm <* rule ws) <|> (charP '(' *> rule expr <* charP ')'))
-  expr <- buildRule ( rule lamRule <|> rule bexpr <|> (ApL <$> rule bexpr <*> rule expr) )
+  bexpr <- buildRule ( (Var <$> nm <* ws) <|> (charP '(' *> expr <* charP ')'))
+  expr <- buildRule ( lamRule <|> bexpr <|> (ApL <$> expr <*> bexpr) )
 
   pure expr
 
